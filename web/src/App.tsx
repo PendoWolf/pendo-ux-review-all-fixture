@@ -1,12 +1,52 @@
 import { useEffect, useState } from "react";
-import { api, type AppState } from "./api";
+import { api, ApiError, type AppState } from "./api";
+
+type Action = "load" | "increment" | "decrement" | "reset" | "refresh";
+type TrackProps = Record<string, string | number | boolean | undefined>;
 
 // Seam for Pendo. Novus installs the Pendo agent, which provides window.pendo
-// at runtime; this fires a Track Event for each action. No-op when the agent
-// isn't present (local dev), so the app and Playwright mocks both stay simple.
-function trackEvent(name: string) {
+// at runtime; this fires a "demo-<name>" Track Event for each action (and
+// "demo-action-failed" when one fails). No-op when the agent isn't present
+// (local dev), so the app and Playwright mocks both stay simple.
+function trackEvent(name: Action | "action-failed", props: TrackProps) {
   if (typeof window !== "undefined") {
-    window.pendo?.track?.(`demo-${name}`);
+    try {
+      window.pendo?.track?.(`demo-${name}`, props);
+    } catch (err) {
+      // Analytics must never break the app, or be reported as a failed action.
+      console.warn("Pendo track failed", err);
+    }
+  }
+}
+
+// Properties sent with each action's success event. `previous` is the state that
+// was on screen when the action started; `next` is the state the API returned.
+function successProps(name: Action, previous: AppState, next: AppState, hadError: boolean): TrackProps {
+  switch (name) {
+    case "load":
+      return { counter: next.counter, lastAction: next.lastAction };
+    case "increment":
+    case "decrement":
+      return {
+        counter: next.counter,
+        previousCounter: previous.counter,
+        previousLastAction: previous.lastAction,
+      };
+    case "reset":
+      // The counter is always 0 after a reset, so report what was cleared instead.
+      return {
+        previousCounter: previous.counter,
+        previousLastAction: previous.lastAction,
+      };
+    case "refresh":
+      return {
+        counter: next.counter,
+        previousCounter: previous.counter,
+        lastAction: next.lastAction,
+        // The counter is shared server state, so a refresh can pull in other sessions' changes.
+        stateChanged: next.counter !== previous.counter || next.lastAction !== previous.lastAction,
+        recoveredFromError: hadError,
+      };
   }
 }
 
@@ -14,13 +54,25 @@ export default function App() {
   const [state, setState] = useState<AppState>({ counter: 0, lastAction: "none" });
   const [error, setError] = useState<string | null>(null);
 
-  const run = async (name: string, fn: () => Promise<AppState>) => {
+  const run = async (name: Action, fn: () => Promise<AppState>) => {
+    // This render's values, i.e. what was on screen when the action started.
+    const previous = state;
+    const hadError = error !== null;
     try {
       setError(null);
-      setState(await fn());
-      trackEvent(name);
+      const next = await fn();
+      setState(next);
+      trackEvent(name, successProps(name, previous, next, hadError));
     } catch (e) {
-      setError((e as Error).message);
+      const message = (e as Error).message;
+      setError(message);
+      trackEvent("action-failed", {
+        action: name,
+        // Bounded so the payload stays well under Pendo's 512-byte properties limit.
+        errorMessage: message.slice(0, 200),
+        // Empty for network/CORS failures, where fetch rejects without a response.
+        httpStatus: e instanceof ApiError ? e.status : undefined,
+      });
     }
   };
 
