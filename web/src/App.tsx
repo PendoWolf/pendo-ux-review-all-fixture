@@ -1,31 +1,79 @@
 import { useEffect, useState } from "react";
-import { api, type AppState } from "./api";
+import { api, ApiError, type AppState } from "./api";
+
+type CounterAction = "load" | "increment" | "decrement" | "reset" | "refresh";
+type TrackProps = Record<string, string | number | boolean | null>;
+
+// Pendo limits a Track Event's properties to 512 bytes of JSON, so cap the one
+// unbounded value we send.
+const MAX_ERROR_MESSAGE_LENGTH = 200;
+
+// Tracks the initial load once per page load (see the mount effect below).
+let initialLoadTracked = false;
 
 // Seam for Pendo. Novus installs the Pendo agent, which provides window.pendo
 // at runtime; this fires a Track Event for each action. No-op when the agent
 // isn't present (local dev), so the app and Playwright mocks both stay simple.
-function trackEvent(name: string) {
+function trackEvent(name: string, props?: TrackProps) {
   if (typeof window !== "undefined") {
-    window.pendo?.track?.(`demo-${name}`);
+    try {
+      window.pendo?.track?.(`demo-${name}`, props);
+    } catch {
+      // Analytics must never break the counter.
+    }
   }
+}
+
+// Properties for demo-<action> once the request succeeds. previousCounter is the
+// value on screen when the action started. The server counter is shared by all
+// visitors, so it can differ from counter by more than one step.
+function successProps(action: CounterAction, next: AppState, previousCounter: number): TrackProps {
+  switch (action) {
+    case "load":
+      return { counter: next.counter, lastAction: next.lastAction };
+    case "increment":
+    case "decrement":
+      return { counter: next.counter, previousCounter };
+    case "reset":
+      return { previousCounter };
+    case "refresh":
+      return { counter: next.counter, previousCounter, counterChanged: next.counter !== previousCounter };
+  }
+}
+
+// Properties for demo-action-failed. httpStatus is null when no response came
+// back (network or CORS failure).
+function failureProps(action: CounterAction, e: unknown): TrackProps {
+  const message = e instanceof Error ? e.message : String(e);
+  return {
+    action,
+    errorMessage: message.slice(0, MAX_ERROR_MESSAGE_LENGTH),
+    httpStatus: e instanceof ApiError ? e.status : null,
+  };
 }
 
 export default function App() {
   const [state, setState] = useState<AppState>({ counter: 0, lastAction: "none" });
   const [error, setError] = useState<string | null>(null);
 
-  const run = async (name: string, fn: () => Promise<AppState>) => {
+  const run = async (action: CounterAction, fn: () => Promise<AppState>, track = true) => {
+    const previousCounter = state.counter;
     try {
       setError(null);
-      setState(await fn());
-      trackEvent(name);
+      const next = await fn();
+      setState(next);
+      if (track) trackEvent(action, successProps(action, next, previousCounter));
     } catch (e) {
       setError((e as Error).message);
+      if (track) trackEvent("action-failed", failureProps(action, e));
     }
   };
 
   useEffect(() => {
-    run("load", api.getState);
+    // StrictMode runs this effect twice in development; track only the first
+    // run so demo-load counts page loads, not fetches.
+    run("load", api.getState, !initialLoadTracked);
+    initialLoadTracked = true;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
